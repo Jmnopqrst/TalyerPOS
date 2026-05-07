@@ -1,0 +1,5 @@
+
+> talyer-pos@0.1.0 start
+> wait-on tcp:5173 dist/main/main.js && node scripts/launch-electron.cjs
+
+
