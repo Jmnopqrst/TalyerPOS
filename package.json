@@ -1,6 +1,7 @@
 {
   "name": "talyer-pos",
-  "version": "0.1.0",
+  "productName": "TalyerPOS",
+  "version": "0.1.2",
   "private": true,
   "description": "Motorcycle repair shop POS and inventory management desktop app.",
   "main": "dist/main/main.js",
@@ -10,23 +11,80 @@
     "dev:main": "tsc -p tsconfig.electron.json --watch --preserveWatchOutput",
     "start": "wait-on tcp:5173 dist/main/main.js && node scripts/launch-electron.cjs",
     "build": "tsc -p tsconfig.electron.json && vite build",
+    "test": "npm run test:compile && node scripts/run-node-tests.cjs",
+    "test:compile": "tsc -p tsconfig.electron.json && tsc -p tsconfig.renderer-tests.json",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win nsis --x64",
     "typecheck": "tsc --noEmit",
     "rebuild:sqlite": "npm rebuild better-sqlite3 --runtime=electron --target=34.5.8 --dist-url=https://electronjs.org/headers"
+  },
+  "build": {
+    "appId": "com.talyerpos.desktop",
+    "productName": "TalyerPOS",
+    "directories": {
+      "output": "release"
+    },
+    "afterPack": "scripts/stamp-windows-icon.cjs",
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "dist/main/main.js"
+    },
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "TalyerPOS-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "TalyerPOS",
+      "uninstallDisplayName": "TalyerPOS"
+    }
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.0",
     "better-sqlite3": "^11.8.1",
-    "electron": "^34.0.0",
+    "jsqr": "^1.4.0",
     "lucide-react": "^0.468.0",
+    "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.5",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
     "concurrently": "^9.1.2",
+    "electron": "^34.0.0",
+    "electron-builder": "^26.8.1",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
     "wait-on": "^8.0.1"

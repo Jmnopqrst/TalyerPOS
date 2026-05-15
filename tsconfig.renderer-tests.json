@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist-tests",
+    "rootDir": "src",
+    "types": ["node"],
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": [
+    "src/renderer/src/features/pos/cartTotals.ts",
+    "src/renderer/src/features/inventory/inventoryForecast.ts",
+    "src/renderer/src/features/payroll/payrollPresentation.ts",
+    "src/renderer/src/features/reports/reportMetrics.ts"
+  ]
+}

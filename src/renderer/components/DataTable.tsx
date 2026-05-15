@@ -41,7 +41,9 @@ export function DataTable<T>({ title, action, footer, emptyMessage = "No records
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={columns.length}>{emptyMessage}</td>
+                <td colSpan={columns.length}>
+                  <div className="table-empty-state">{emptyMessage}</div>
+                </td>
               </tr>
             )}
           </tbody>

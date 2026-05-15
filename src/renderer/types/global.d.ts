@@ -26,14 +26,28 @@ declare global {
       updateMechanic(payload: UpdateMechanicPayload): Promise<UserAccount>;
       setMechanicStatus(payload: SetMechanicStatusPayload): Promise<{ ok: boolean }>;
       deleteMechanic(payload: DeleteMechanicPayload): Promise<{ ok: boolean }>;
+      updateMechanicPayroll(payload: UpdateMechanicPayrollPayload): Promise<UserAccount>;
+      recordMechanicAttendance(payload: RecordMechanicAttendancePayload): Promise<{ action: "Time In" | "Time Out"; mechanicName: string; recordedAt: string }>;
+      updateMechanicAttendance(payload: UpdateMechanicAttendancePayload): Promise<{ ok: boolean }>;
+      generatePayroll(payload: GeneratePayrollPayload): Promise<PayrollRun>;
+      createPayrollCutoff(payload: CreatePayrollCutoffPayload): Promise<PayrollCutoff>;
+      submitPayrollForReview(payload: PayrollStatusPayload): Promise<PayrollRun>;
+      approvePayrollRun(payload: PayrollStatusPayload): Promise<PayrollRun>;
+      markPayrollPaid(payload: MarkPayrollPaidPayload): Promise<{ ok: boolean; paidAt: string }>;
+      cancelPayrollRun(payload: PayrollReasonPayload): Promise<PayrollRun>;
+      voidPayrollRun(payload: PayrollReasonPayload): Promise<PayrollRun>;
+      updatePayrollSettings(payload: UpdatePayrollSettingsPayload): Promise<PayrollSettings>;
       createSupplier(payload: CreateSupplierPayload): Promise<Supplier>;
       updateSupplier(payload: UpdateSupplierPayload): Promise<Supplier>;
       deleteSupplier(payload: DeleteSupplierPayload): Promise<{ ok: boolean }>;
+      createPurchaseOrder(payload: CreatePurchaseOrderPayload): Promise<{ id: number; orderNo: string }>;
+      updatePurchaseOrderStatus(payload: UpdatePurchaseOrderStatusPayload): Promise<{ ok: boolean }>;
       createExpense(payload: CreateExpensePayload): Promise<{ id: number }>;
       updateExpense(payload: UpdateExpensePayload): Promise<{ ok: boolean }>;
       deleteExpense(payload: DeleteExpensePayload): Promise<{ ok: boolean }>;
       listPrinters(): Promise<PrinterOption[]>;
       listData(): Promise<AppData>;
+      listDataScope(payload: ListDataScopePayload): Promise<Partial<AppData>>;
       createInventoryItem(payload: CreateInventoryItemPayload): Promise<{ productCode: string }>;
       updateInventoryItem(payload: UpdateInventoryItemPayload): Promise<{ ok: boolean }>;
       deleteInventoryItem(payload: DeleteInventoryItemPayload): Promise<{ ok: boolean }>;
@@ -46,7 +60,10 @@ declare global {
       optimizeDatabase(payload: SuperAdminActionPayload): Promise<SuperAdminData>;
       clearOldLogs(payload: ClearOldLogsPayload): Promise<SuperAdminData>;
       createBackup(payload: SuperAdminActionPayload): Promise<SuperAdminData>;
+      updateAutomaticBackupSettings(payload: UpdateAutomaticBackupSettingsPayload): Promise<SuperAdminData>;
+      chooseBackupFolder(): Promise<string>;
       exportDatabase(payload: SuperAdminActionPayload): Promise<SuperAdminData>;
+      previewRestoreDatabase(payload: RestoreDatabasePayload): Promise<BackupRestorePreview | null>;
       restoreDatabase(payload: RestoreDatabasePayload): Promise<SuperAdminData>;
       clearDatabase(payload: ClearDatabasePayload): Promise<SuperAdminData>;
       printReceipt(payload: ReceiptDocumentPayload): Promise<boolean>;
@@ -56,6 +73,26 @@ declare global {
 }
 
 export type Role = "Owner" | "Admin" | "Cashier" | "SuperAdmin";
+export type PayrollType = "Per Hour" | "Per Day" | "Per Week" | "Per Month";
+export type CompensationType = "Fixed Salary" | "Commission" | "Hybrid";
+export type PayrollStatus = "Draft" | "Pending Review" | "Approved" | "Paid" | "Cancelled" | "Void";
+export type AttendanceStatus = "Present" | "Absent" | "Late" | "Half Day" | "Sick Leave" | "Vacation Leave" | "Holiday" | "Rest Day" | "Incomplete Attendance";
+export type DataScope = "all" | "core" | "sales" | "inventory" | "jobs" | "customers" | "payroll" | "reports" | "settings" | "users" | "staff" | "suppliers" | "purchases" | "audit";
+
+export interface ListDataScopePayload {
+  scope: DataScope;
+}
+
+export interface PayrollSettings {
+  id: number;
+  required_hours_per_day: number;
+  required_hours_per_week: number;
+  required_hours_per_month: number;
+  working_days: string;
+  consider_holidays_paid: 0 | 1;
+  holiday_dates: string;
+  updated_at: string;
+}
 
 export interface UserAccount {
   id: number;
@@ -66,10 +103,17 @@ export interface UserAccount {
   address: string;
   email: string;
   is_mechanic: 0 | 1;
+  branch_id?: number | null;
   must_change_password: 0 | 1;
   status: "Active" | "Disabled";
   created_at?: string;
   created_by_name?: string;
+  mechanic_code?: string;
+  qr_code?: string;
+  payroll_type?: PayrollType;
+  salary_rate?: number;
+  compensation_type?: CompensationType;
+  labor_commission_percentage?: number;
 }
 
 export interface ReceiptSettings {
@@ -84,7 +128,12 @@ export interface ReceiptSettings {
   footer_message: string;
   show_tax_id: 0 | 1;
   show_cashier: 0 | 1;
-  paper_width: 58 | 80;
+  paper_width: 58 | 80 | 216;
+  receipt_template: "Compact" | "Detailed";
+  show_labor_breakdown: 0 | 1;
+  custom_header: string;
+  custom_footer: string;
+  logo_size: "Small" | "Medium" | "Large";
   receipt_output_mode: "Printer" | "PDF";
   receipt_printer_name: string;
 }
@@ -104,7 +153,15 @@ export interface SuperAdminSettings {
   license_key: string;
   license_status: "Trial" | "Activated";
   last_backup_at: string;
-  backup_schedule: "Manual" | "Daily" | "Weekly";
+  backup_schedule: "Disabled" | "Daily" | "Weekly" | "Monthly";
+  backup_time: string;
+  backup_weekday: number;
+  backup_month_day: number;
+  backup_folder: string;
+  backup_retention_count: number;
+  last_auto_backup_at: string;
+  last_backup_error: string;
+  payroll_module_enabled: 0 | 1;
   updated_at: string;
   trial: TrialStatus;
 }
@@ -124,8 +181,18 @@ export interface SuperAdminData {
     lastBackupAt: string;
     failedTransactions: number;
     failedReceipts: number;
+    integrityStatus: string;
+    integrityOk: boolean;
+    lastMigrationCheckAt: string;
+    pageCount: number;
+    pageSize: number;
+    walSizeBytes: number;
+    indexesPresent: string[];
+    indexesMissing: string[];
+    failedBackupCount: number;
+    pendingApprovalSensitiveActions: number;
   };
-  backupHistory: SystemLog[];
+  backupHistory: BackupHistory[];
   systemLogs: SystemLog[];
 }
 
@@ -143,13 +210,51 @@ export interface ClearDatabasePayload extends SuperAdminActionPayload {
 
 export interface RestoreDatabasePayload extends SuperAdminActionPayload {
   password: string;
+  restorePath?: string;
+}
+
+export interface BackupRestorePreview {
+  filePath: string;
+  filename: string;
+  fileSize: number;
+  modifiedAt: string;
+  integrityOk: boolean;
+  integrityDetail: string;
+  counts: {
+    users: number;
+    sales: number;
+    jobs: number;
+    inventory: number;
+    auditLogs: number;
+  };
 }
 
 export interface UpdateTrialSettingsPayload extends SuperAdminActionPayload {
   trialEnabled: boolean;
   trialDays: number;
-  backupSchedule: "Manual" | "Daily" | "Weekly";
   licenseKey?: string;
+  payrollModuleEnabled?: boolean;
+}
+
+export interface UpdateAutomaticBackupSettingsPayload extends SuperAdminActionPayload {
+  backupSchedule: "Disabled" | "Daily" | "Weekly" | "Monthly";
+  backupTime: string;
+  backupWeekday: number;
+  backupMonthDay: number;
+  backupFolder: string;
+  backupRetentionCount: number;
+}
+
+export interface BackupHistory {
+  id: number;
+  filename: string;
+  file_path: string;
+  backup_date: string;
+  file_size: number;
+  backup_type: "Manual" | "Automatic";
+  status: "Success" | "Failed";
+  details: string;
+  created_at: string;
 }
 
 export interface UpdateReceiptSettingsPayload {
@@ -165,6 +270,11 @@ export interface UpdateReceiptSettingsPayload {
   showTaxId: boolean;
   showCashier: boolean;
   paperWidth: number;
+  receiptTemplate: "Compact" | "Detailed";
+  showLaborBreakdown: boolean;
+  customHeader: string;
+  customFooter: string;
+  logoSize: "Small" | "Medium" | "Large";
 }
 
 export interface PrinterOption {
@@ -300,6 +410,8 @@ export interface CreateInventoryItemPayload {
   categoryId: number;
   name: string;
   stock: number;
+  reorderLevel?: number;
+  unitCost?: number;
   sellPrice: number;
   supplierId?: number | null;
 }
@@ -407,12 +519,129 @@ export interface DeleteMechanicPayload {
   mechanicId: number;
 }
 
+export type PurchaseOrderStatus = "Draft" | "Ordered" | "Partially Received" | "Received" | "Cancelled";
+
+export interface PurchaseOrder {
+  id: number;
+  order_no: string;
+  supplier_id?: number | null;
+  supplier_name?: string;
+  status: PurchaseOrderStatus;
+  notes: string;
+  created_by: number;
+  created_by_name?: string;
+  created_at: string;
+  updated_at: string;
+  received_at?: string;
+}
+
+export interface PurchaseOrderItem {
+  id: number;
+  purchase_order_id: number;
+  item_id: number;
+  product_code: string;
+  item_name: string;
+  quantity_ordered: number;
+  quantity_received: number;
+  unit_cost: number;
+}
+
+export interface CreatePurchaseOrderPayload {
+  actorId: number;
+  supplierId?: number | null;
+  notes?: string;
+  items: Array<{
+    itemId: number;
+    quantityOrdered: number;
+    unitCost?: number;
+  }>;
+}
+
+export interface UpdatePurchaseOrderStatusPayload {
+  actorId: number;
+  purchaseOrderId: number;
+  status: PurchaseOrderStatus;
+  receivedItems?: Array<{
+    itemId: number;
+    quantityReceived: number;
+  }>;
+}
+
+export interface UpdateMechanicPayrollPayload {
+  actorId: number;
+  mechanicId: number;
+  payrollType: PayrollType;
+  salaryRate: number;
+  compensationType: CompensationType;
+  laborCommissionPercentage: number;
+}
+
+export interface RecordMechanicAttendancePayload {
+  actorId?: number;
+  qrCode: string;
+}
+
+export interface UpdateMechanicAttendancePayload {
+  actorId: number;
+  attendanceId?: number;
+  mechanicId: number;
+  attendanceDate: string;
+  timeIn?: string;
+  timeOut?: string;
+  status: AttendanceStatus;
+  notes?: string;
+}
+
+export interface GeneratePayrollPayload {
+  actorId: number;
+  mechanicId: number;
+  periodStart?: string;
+  periodEnd?: string;
+  cutoffId?: number;
+  deductions?: number;
+}
+
+export interface CreatePayrollCutoffPayload {
+  actorId: number;
+  name: string;
+  periodStart: string;
+  periodEnd: string;
+  payDate: string;
+  branchId?: number;
+}
+
+export interface PayrollStatusPayload {
+  actorId: number;
+  payrollId: number;
+}
+
+export interface PayrollReasonPayload extends PayrollStatusPayload {
+  reason: string;
+}
+
+export interface MarkPayrollPaidPayload {
+  actorId: number;
+  payrollId: number;
+  paymentMethod?: string;
+}
+
+export interface UpdatePayrollSettingsPayload {
+  actorId: number;
+  requiredHoursPerDay: number;
+  requiredHoursPerWeek: number;
+  requiredHoursPerMonth: number;
+  workingDays: number[];
+  considerHolidaysPaid: boolean;
+  holidayDates: string[];
+}
+
 export interface Customer {
   id: number;
   name: string;
   phone: string;
   email: string;
   address: string;
+  created_at?: string;
 }
 
 export interface Motorcycle {
@@ -450,11 +679,44 @@ export interface JobOrder {
   paid_at?: string;
   mechanic_name: string;
   mechanic_id?: number;
+  branch_id?: number | null;
   status: string;
   concern: string;
   estimate: number;
   created_at: string;
   due_at: string;
+}
+
+export interface Branch {
+  id: number;
+  name: string;
+  code: string;
+  status: "Active" | "Inactive";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PayrollPermission {
+  id: number;
+  role_name: string;
+  permission_key: string;
+  enabled: 0 | 1;
+  updated_at: string;
+}
+
+export interface JobPayrollAllocation {
+  id: number;
+  job_order_id: number;
+  mechanic_id: number;
+  mechanic_name?: string;
+  mechanic_code?: string;
+  allocation_role: string;
+  allocation_type: "Percent" | "Fixed";
+  percentage: number;
+  fixed_amount: number;
+  is_lead: 0 | 1;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface JobStatusHistory {
@@ -482,6 +744,7 @@ export interface CreateJobOrderPayload {
   plateNumber: string;
   serviceId: number;
   mechanicId: number;
+  branchId?: number;
 }
 
 export interface UpdateJobOrderPayload {
@@ -490,6 +753,14 @@ export interface UpdateJobOrderPayload {
   status: string;
   products: JobProduct[];
   additionalLaborCost?: number;
+  payrollAllocations?: Array<{
+    mechanicId: number;
+    allocationRole?: string;
+    allocationType?: "Percent" | "Fixed";
+    percentage?: number;
+    fixedAmount?: number;
+    isLead?: boolean;
+  }>;
 }
 
 export interface JobCompletionSummary {
@@ -600,11 +871,93 @@ export interface AuditLog {
   created_at: string;
 }
 
+export interface MechanicAttendance {
+  id: number;
+  mechanic_id: number;
+  mechanic_name: string;
+  mechanic_code?: string;
+  attendance_date: string;
+  time_in?: string;
+  time_out?: string;
+  status: AttendanceStatus;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PayrollCutoff {
+  id: number;
+  branch_id?: number | null;
+  name: string;
+  period_start: string;
+  period_end: string;
+  pay_date: string;
+  status: "Open" | "Closed" | "Cancelled";
+  created_by?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PayrollRun {
+  id: number;
+  mechanic_id: number;
+  mechanic_name?: string;
+  mechanic_code?: string;
+  cutoff_id?: number;
+  cutoff_name?: string;
+  cutoff_pay_date?: string;
+  branch_id?: number | null;
+  period_start: string;
+  period_end: string;
+  payroll_type: PayrollType;
+  compensation_type: CompensationType;
+  attendance_count: number;
+  hours_worked: number;
+  required_hours: number;
+  expected_hours: number;
+  credited_hours: number;
+  hour_deficit: number;
+  attendance_completion: number;
+  hourly_equivalent_rate: number;
+  holiday_paid_hours: number;
+  base_salary: number;
+  labor_commission: number;
+  additional_incentives: number;
+  deductions: number;
+  gross_pay: number;
+  net_pay: number;
+  status: PayrollStatus;
+  payment_date?: string;
+  payment_method: string;
+  processed_by?: number;
+  processed_by_name?: string;
+  approved_by?: number;
+  approved_by_name?: string;
+  approved_at?: string;
+  paid_by?: number;
+  paid_by_name?: string;
+  voided_by?: number;
+  voided_at?: string;
+  status_reason: string;
+  locked_at?: string;
+  attendance_snapshot_json: string;
+  payroll_settings_snapshot_json: string;
+  mechanic_rate_snapshot_json: string;
+  commission_snapshot_json: string;
+  adjustments_snapshot_json: string;
+  cash_advance_snapshot_json: string;
+  computed_totals_snapshot_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AppData {
   users: UserAccount[];
   customers: Customer[];
   motorcycles: Motorcycle[];
   suppliers: Supplier[];
+  purchaseOrders: PurchaseOrder[];
+  purchaseOrderItems: PurchaseOrderItem[];
   inventoryCategories: InventoryCategory[];
   services: Service[];
   inventory: InventoryItem[];
@@ -616,6 +969,13 @@ export interface AppData {
   paymentMethods: PaymentMethod[];
   expenses: Expense[];
   auditLogs: AuditLog[];
+  branches: Branch[];
+  payrollPermissions: PayrollPermission[];
+  jobPayrollAllocations: JobPayrollAllocation[];
+  mechanicAttendance: MechanicAttendance[];
+  payrollRuns: PayrollRun[];
+  payrollCutoffs: PayrollCutoff[];
+  payrollSettings: PayrollSettings;
   receiptSettings: ReceiptSettings;
   superAdminSettings: SuperAdminSettings;
 }

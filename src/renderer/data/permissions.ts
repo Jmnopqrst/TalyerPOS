@@ -5,25 +5,28 @@ export type ModuleKey =
   | "pos"
   | "inventory"
   | "jobs"
+  | "customers"
   | "services"
   | "staff"
   | "suppliers"
+  | "purchases"
   | "reports"
+  | "payroll"
   | "users"
   | "settings"
   | "audit";
 
 const permissions: Record<Role, ModuleKey[]> = {
-  Owner: ["dashboard", "pos", "inventory", "jobs", "services", "staff", "suppliers", "reports", "users", "settings", "audit"],
-  Admin: ["dashboard", "inventory", "jobs", "services", "staff", "suppliers", "reports", "settings"],
+  Owner: ["dashboard", "pos", "inventory", "jobs", "customers", "services", "staff", "suppliers", "purchases", "reports", "payroll", "users", "settings", "audit"],
+  Admin: ["dashboard", "inventory", "jobs", "customers", "services", "staff", "suppliers", "purchases", "reports", "settings"],
   Cashier: ["dashboard", "pos", "jobs"],
   SuperAdmin: []
 };
 
 export function canAccess(role: Role, module: ModuleKey) {
-  return permissions[role].includes(module);
+  return (permissions[role] ?? []).includes(module);
 }
 
 export function modulesFor(role: Role) {
-  return permissions[role];
+  return permissions[role] ?? ["dashboard"];
 }

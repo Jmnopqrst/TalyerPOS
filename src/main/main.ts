@@ -1,13 +1,42 @@
 import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent, type OpenDialogOptions, type SaveDialogOptions } from "electron";
+import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { adjustInventoryStock, backupDatabaseFile, changePassword, clearOldLogs, clearOperationalDatabase, closeDatabase, createExpense, createInventoryCategory, createInventoryItem, createJobOrder, createMechanic, createPaymentMethod, createSale, createService, createSupplier, createUser, databaseFilePath, deleteExpense, deleteInventoryCategory, deleteInventoryItem, deleteMechanic, deletePaymentMethod, deleteService, deleteSupplier, disableUser, enableUser, getSuperAdminConsoleData, getReceiptSettings, listAll, login, markBackupCreated, optimizeDatabase, payJobOrder, recordSystemLog, setMechanicStatus, setPaymentMethodStatus, stockInInventoryItem, updateExpense, updateInventoryItem, updateJobOrder, updateMechanic, updatePaymentMethod, updateReceiptPrinterSettings, updateReceiptSettings, updateService, updateSupplier, updateTrialSettings, verifySuperAdminPassword, voidOrRefundSale } from "./database";
+import { clearOldLogs, recordSystemLog } from "./db/audit";
+import { changePassword, createUser, disableUser, enableUser, login, verifySuperAdminPassword } from "./db/auth";
+import { adjustInventoryStock, createInventoryCategory, createInventoryItem, createPurchaseOrder, createSupplier, deleteInventoryCategory, deleteInventoryItem, deleteSupplier, stockInInventoryItem, updateInventoryItem, updatePurchaseOrderStatus, updateSupplier } from "./db/inventory";
+import { createJobOrder, payJobOrder, updateJobOrder } from "./db/jobs";
+import { listAll, listDataScope, type DataScope } from "./db/migrations";
+import { approvePayrollRun, cancelPayrollRun, createMechanic, createPayrollCutoff, deleteMechanic, generatePayroll, markPayrollPaid, recordMechanicAttendance, setMechanicStatus, submitPayrollForReview, updateMechanic, updateMechanicAttendance, updateMechanicPayroll, updatePayrollSettings, voidPayrollRun } from "./db/payroll";
+import { createSale, voidOrRefundSale } from "./db/sales";
+import { backupDatabaseFile, closeDatabase, databaseFilePath } from "./db/schema";
+import { clearOperationalDatabase, createExpense, createPaymentMethod, createService, deleteExpense, deletePaymentMethod, deleteService, getAutomaticBackupSettings, getReceiptSettings, getSuperAdminConsoleData, markBackupCreated, markBackupFailed, optimizeDatabase, setPaymentMethodStatus, updateAutomaticBackupSettings, updateExpense, updatePaymentMethod, updateReceiptPrinterSettings, updateReceiptSettings, updateService, updateTrialSettings } from "./db/settings";
+import { validateIpcPayload, type IpcPayloadChannel } from "./ipcValidation";
 
 const isDev = process.env.VITE_DEV_SERVER_URL || !app.isPackaged;
+let backupTimer: NodeJS.Timeout | null = null;
+let backupInProgress = false;
+
+function checkedPayload<T>(channel: IpcPayloadChannel, payload: unknown) {
+  return validateIpcPayload<T>(channel, payload);
+}
+
+app.commandLine.appendSwitch("disable-features", "MediaFoundationD3D11VideoCapture,MediaFoundationD3D11VideoCaptureZeroCopy");
+app.commandLine.appendSwitch("disable-accelerated-video-decode");
+app.commandLine.appendSwitch("disable-gpu");
+app.commandLine.appendSwitch("disable-gpu-compositing");
+app.commandLine.appendSwitch("use-angle", "swiftshader");
+
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!hasSingleInstanceLock) {
   app.quit();
+}
+
+app.setAppUserModelId("com.talyerpos.desktop");
+
+function getAppIconPath() {
+  return isDev ? path.join(app.getAppPath(), "icon.ico") : path.join(process.resourcesPath, "icon.ico");
 }
 
 function createWindow() {
@@ -16,7 +45,10 @@ function createWindow() {
     height: 920,
     minWidth: 1180,
     minHeight: 720,
+    fullscreen: true,
+    autoHideMenuBar: true,
     title: "TalyerPOS",
+    icon: getAppIconPath(),
     backgroundColor: "#f4f1ec",
     webPreferences: {
       preload: path.join(__dirname, "../preload/preload.js"),
@@ -33,59 +65,99 @@ function createWindow() {
 }
 
 if (hasSingleInstanceLock) app.whenReady().then(() => {
-  ipcMain.handle("auth:login", (_event, payload: { username: string; password: string }) => login(payload.username, payload.password));
-  ipcMain.handle("auth:change-password", (_event, payload) => changePassword(payload));
-  ipcMain.handle("users:create", (_event, payload) => createUser(payload));
-  ipcMain.handle("users:disable", (_event, payload) => disableUser(payload));
-  ipcMain.handle("users:enable", (_event, payload) => enableUser(payload));
-  ipcMain.handle("jobs:create", (_event, payload) => createJobOrder(payload));
-  ipcMain.handle("jobs:update", (_event, payload) => updateJobOrder(payload));
-  ipcMain.handle("jobs:pay", (_event, payload) => payJobOrder(payload));
-  ipcMain.handle("settings:receipt:update", (_event, payload) => updateReceiptSettings(payload));
-  ipcMain.handle("settings:printer:update", async (_event, payload: { actorId: number; outputMode: "Printer" | "PDF"; printerName: string; approvalUsername: string; approvalPassword: string; approvalReason: string }) => {
+  ipcMain.handle("auth:login", (_event, payload) => {
+    const next = checkedPayload<{ username: string; password: string }>("auth:login", payload);
+    return login(next.username, next.password);
+  });
+  ipcMain.handle("auth:change-password", (_event, payload) => changePassword(checkedPayload<Parameters<typeof changePassword>[0]>("auth:change-password", payload)));
+  ipcMain.handle("users:create", (_event, payload) => createUser(checkedPayload<Parameters<typeof createUser>[0]>("users:create", payload)));
+  ipcMain.handle("users:disable", (_event, payload) => disableUser(checkedPayload<Parameters<typeof disableUser>[0]>("users:disable", payload)));
+  ipcMain.handle("users:enable", (_event, payload) => enableUser(checkedPayload<Parameters<typeof enableUser>[0]>("users:enable", payload)));
+  ipcMain.handle("jobs:create", (_event, payload) => createJobOrder(checkedPayload<Parameters<typeof createJobOrder>[0]>("jobs:create", payload)));
+  ipcMain.handle("jobs:update", (_event, payload) => updateJobOrder(checkedPayload<Parameters<typeof updateJobOrder>[0]>("jobs:update", payload)));
+  ipcMain.handle("jobs:pay", (_event, payload) => payJobOrder(checkedPayload<Parameters<typeof payJobOrder>[0]>("jobs:pay", payload)));
+  ipcMain.handle("settings:receipt:update", (_event, payload) => updateReceiptSettings(checkedPayload<Parameters<typeof updateReceiptSettings>[0]>("settings:receipt:update", payload)));
+  ipcMain.handle("settings:printer:update", async (_event, rawPayload) => {
+    const payload = checkedPayload<Parameters<typeof updateReceiptPrinterSettings>[0]>("settings:printer:update", rawPayload);
     if (payload.outputMode === "Printer") {
       const printers = await listPrinters();
       if (!printers.some((printer) => printer.name === payload.printerName)) throw new Error("Selected printer is no longer available.");
     }
     return updateReceiptPrinterSettings(payload);
   });
-  ipcMain.handle("settings:category:create", (_event, payload) => createInventoryCategory(payload));
-  ipcMain.handle("settings:category:delete", (_event, payload) => deleteInventoryCategory(payload));
-  ipcMain.handle("settings:payment:create", (_event, payload) => createPaymentMethod(payload));
-  ipcMain.handle("settings:payment:update", (_event, payload) => updatePaymentMethod(payload));
-  ipcMain.handle("settings:payment:status", (_event, payload) => setPaymentMethodStatus(payload));
-  ipcMain.handle("settings:payment:delete", (_event, payload) => deletePaymentMethod(payload));
-  ipcMain.handle("services:create", (_event, payload) => createService(payload));
-  ipcMain.handle("services:update", (_event, payload) => updateService(payload));
-  ipcMain.handle("services:delete", (_event, payload) => deleteService(payload));
-  ipcMain.handle("mechanics:create", (_event, payload) => createMechanic(payload));
-  ipcMain.handle("mechanics:update", (_event, payload) => updateMechanic(payload));
-  ipcMain.handle("mechanics:status", (_event, payload) => setMechanicStatus(payload));
-  ipcMain.handle("mechanics:delete", (_event, payload) => deleteMechanic(payload));
-  ipcMain.handle("suppliers:create", (_event, payload) => createSupplier(payload));
-  ipcMain.handle("suppliers:update", (_event, payload) => updateSupplier(payload));
-  ipcMain.handle("suppliers:delete", (_event, payload) => deleteSupplier(payload));
-  ipcMain.handle("expenses:create", (_event, payload) => createExpense(payload));
-  ipcMain.handle("expenses:update", (_event, payload) => updateExpense(payload));
-  ipcMain.handle("expenses:delete", (_event, payload) => deleteExpense(payload));
+  ipcMain.handle("settings:category:create", (_event, payload) => createInventoryCategory(checkedPayload<Parameters<typeof createInventoryCategory>[0]>("settings:category:create", payload)));
+  ipcMain.handle("settings:category:delete", (_event, payload) => deleteInventoryCategory(checkedPayload<Parameters<typeof deleteInventoryCategory>[0]>("settings:category:delete", payload)));
+  ipcMain.handle("settings:payment:create", (_event, payload) => createPaymentMethod(checkedPayload<Parameters<typeof createPaymentMethod>[0]>("settings:payment:create", payload)));
+  ipcMain.handle("settings:payment:update", (_event, payload) => updatePaymentMethod(checkedPayload<Parameters<typeof updatePaymentMethod>[0]>("settings:payment:update", payload)));
+  ipcMain.handle("settings:payment:status", (_event, payload) => setPaymentMethodStatus(checkedPayload<Parameters<typeof setPaymentMethodStatus>[0]>("settings:payment:status", payload)));
+  ipcMain.handle("settings:payment:delete", (_event, payload) => deletePaymentMethod(checkedPayload<Parameters<typeof deletePaymentMethod>[0]>("settings:payment:delete", payload)));
+  ipcMain.handle("services:create", (_event, payload) => createService(checkedPayload<Parameters<typeof createService>[0]>("services:create", payload)));
+  ipcMain.handle("services:update", (_event, payload) => updateService(checkedPayload<Parameters<typeof updateService>[0]>("services:update", payload)));
+  ipcMain.handle("services:delete", (_event, payload) => deleteService(checkedPayload<Parameters<typeof deleteService>[0]>("services:delete", payload)));
+  ipcMain.handle("mechanics:create", (_event, payload) => createMechanic(checkedPayload<Parameters<typeof createMechanic>[0]>("mechanics:create", payload)));
+  ipcMain.handle("mechanics:update", (_event, payload) => updateMechanic(checkedPayload<Parameters<typeof updateMechanic>[0]>("mechanics:update", payload)));
+  ipcMain.handle("mechanics:status", (_event, payload) => setMechanicStatus(checkedPayload<Parameters<typeof setMechanicStatus>[0]>("mechanics:status", payload)));
+  ipcMain.handle("mechanics:delete", (_event, payload) => deleteMechanic(checkedPayload<Parameters<typeof deleteMechanic>[0]>("mechanics:delete", payload)));
+  ipcMain.handle("payroll:mechanic:update", (_event, payload) => updateMechanicPayroll(checkedPayload<Parameters<typeof updateMechanicPayroll>[0]>("payroll:mechanic:update", payload)));
+  ipcMain.handle("payroll:attendance:record", (_event, payload) => recordMechanicAttendance(checkedPayload<Parameters<typeof recordMechanicAttendance>[0]>("payroll:attendance:record", payload)));
+  ipcMain.handle("payroll:attendance:update", (_event, payload) => updateMechanicAttendance(checkedPayload<Parameters<typeof updateMechanicAttendance>[0]>("payroll:attendance:update", payload)));
+  ipcMain.handle("payroll:generate", (_event, payload) => generatePayroll(checkedPayload<Parameters<typeof generatePayroll>[0]>("payroll:generate", payload)));
+  ipcMain.handle("payroll:cutoff:create", (_event, payload) => createPayrollCutoff(checkedPayload<Parameters<typeof createPayrollCutoff>[0]>("payroll:cutoff:create", payload)));
+  ipcMain.handle("payroll:review", (_event, payload) => submitPayrollForReview(checkedPayload<Parameters<typeof submitPayrollForReview>[0]>("payroll:review", payload)));
+  ipcMain.handle("payroll:approve", (_event, payload) => approvePayrollRun(checkedPayload<Parameters<typeof approvePayrollRun>[0]>("payroll:approve", payload)));
+  ipcMain.handle("payroll:paid", (_event, payload) => markPayrollPaid(checkedPayload<Parameters<typeof markPayrollPaid>[0]>("payroll:paid", payload)));
+  ipcMain.handle("payroll:cancel", (_event, payload) => cancelPayrollRun(checkedPayload<Parameters<typeof cancelPayrollRun>[0]>("payroll:cancel", payload)));
+  ipcMain.handle("payroll:void", (_event, payload) => voidPayrollRun(checkedPayload<Parameters<typeof voidPayrollRun>[0]>("payroll:void", payload)));
+  ipcMain.handle("payroll:settings:update", (_event, payload) => updatePayrollSettings(checkedPayload<Parameters<typeof updatePayrollSettings>[0]>("payroll:settings:update", payload)));
+  ipcMain.handle("suppliers:create", (_event, payload) => createSupplier(checkedPayload<Parameters<typeof createSupplier>[0]>("suppliers:create", payload)));
+  ipcMain.handle("suppliers:update", (_event, payload) => updateSupplier(checkedPayload<Parameters<typeof updateSupplier>[0]>("suppliers:update", payload)));
+  ipcMain.handle("suppliers:delete", (_event, payload) => deleteSupplier(checkedPayload<Parameters<typeof deleteSupplier>[0]>("suppliers:delete", payload)));
+  ipcMain.handle("purchases:create", (_event, payload) => createPurchaseOrder(checkedPayload<Parameters<typeof createPurchaseOrder>[0]>("purchases:create", payload)));
+  ipcMain.handle("purchases:status", (_event, payload) => updatePurchaseOrderStatus(checkedPayload<Parameters<typeof updatePurchaseOrderStatus>[0]>("purchases:status", payload)));
+  ipcMain.handle("expenses:create", (_event, payload) => createExpense(checkedPayload<Parameters<typeof createExpense>[0]>("expenses:create", payload)));
+  ipcMain.handle("expenses:update", (_event, payload) => updateExpense(checkedPayload<Parameters<typeof updateExpense>[0]>("expenses:update", payload)));
+  ipcMain.handle("expenses:delete", (_event, payload) => deleteExpense(checkedPayload<Parameters<typeof deleteExpense>[0]>("expenses:delete", payload)));
   ipcMain.handle("printers:list", async () => listPrinters());
   ipcMain.handle("data:list", () => listAll());
-  ipcMain.handle("inventory:create", (_event, payload) => createInventoryItem(payload));
-  ipcMain.handle("inventory:update", (_event, payload) => updateInventoryItem(payload));
-  ipcMain.handle("inventory:delete", (_event, payload) => deleteInventoryItem(payload));
-  ipcMain.handle("inventory:stock-in", (_event, payload) => stockInInventoryItem(payload));
-  ipcMain.handle("inventory:adjust", (_event, payload) => adjustInventoryStock(payload));
-  ipcMain.handle("sales:create", (_event, payload) => createSale(payload));
-  ipcMain.handle("sales:void-refund", (_event, payload) => voidOrRefundSale(payload));
+  ipcMain.handle("data:list-scope", (_event, payload) => listDataScope(checkedPayload<{ scope: DataScope }>("data:list-scope", payload).scope));
+  ipcMain.handle("inventory:create", (_event, payload) => createInventoryItem(checkedPayload<Parameters<typeof createInventoryItem>[0]>("inventory:create", payload)));
+  ipcMain.handle("inventory:update", (_event, payload) => updateInventoryItem(checkedPayload<Parameters<typeof updateInventoryItem>[0]>("inventory:update", payload)));
+  ipcMain.handle("inventory:delete", (_event, payload) => deleteInventoryItem(checkedPayload<Parameters<typeof deleteInventoryItem>[0]>("inventory:delete", payload)));
+  ipcMain.handle("inventory:stock-in", (_event, payload) => stockInInventoryItem(checkedPayload<Parameters<typeof stockInInventoryItem>[0]>("inventory:stock-in", payload)));
+  ipcMain.handle("inventory:adjust", (_event, payload) => adjustInventoryStock(checkedPayload<Parameters<typeof adjustInventoryStock>[0]>("inventory:adjust", payload)));
+  ipcMain.handle("sales:create", (_event, payload) => createSale(checkedPayload<Parameters<typeof createSale>[0]>("sales:create", payload)));
+  ipcMain.handle("sales:void-refund", (_event, payload) => voidOrRefundSale(checkedPayload<Parameters<typeof voidOrRefundSale>[0]>("sales:void-refund", payload)));
   ipcMain.handle("super-admin:data", () => getSuperAdminConsoleData());
-  ipcMain.handle("super-admin:trial:update", (_event, payload) => updateTrialSettings(payload));
-  ipcMain.handle("super-admin:database:optimize", (_event, payload) => optimizeDatabase(payload));
-  ipcMain.handle("super-admin:logs:clear", (_event, payload) => clearOldLogs(payload));
-  ipcMain.handle("super-admin:backup:create", async (event, payload: { superAdminId: number }) => createDatabaseBackup(event, payload.superAdminId));
-  ipcMain.handle("super-admin:database:export", async (event, payload: { superAdminId: number }) => exportDatabaseFile(event, payload.superAdminId));
-  ipcMain.handle("super-admin:database:restore", async (event, payload: { superAdminId: number; password: string }) => restoreDatabaseBackup(event, payload.superAdminId, payload.password));
-  ipcMain.handle("super-admin:database:clear", async (event, payload: { superAdminId: number; password: string }) => clearDatabaseWithBackup(event, payload.superAdminId, payload.password));
-  ipcMain.handle("print:receipt", async (_event, payload: { html: string }) => {
+  ipcMain.handle("super-admin:trial:update", (_event, payload) => updateTrialSettings(checkedPayload<Parameters<typeof updateTrialSettings>[0]>("super-admin:trial:update", payload)));
+  ipcMain.handle("super-admin:database:optimize", (_event, payload) => optimizeDatabase(checkedPayload<Parameters<typeof optimizeDatabase>[0]>("super-admin:database:optimize", payload)));
+  ipcMain.handle("super-admin:logs:clear", (_event, payload) => clearOldLogs(checkedPayload<Parameters<typeof clearOldLogs>[0]>("super-admin:logs:clear", payload)));
+  ipcMain.handle("super-admin:backup:create", async (event, payload) => createDatabaseBackup(event, checkedPayload<{ superAdminId: number }>("super-admin:backup:create", payload).superAdminId));
+  ipcMain.handle("super-admin:backup:settings", async (_event, payload) => {
+    const next = updateAutomaticBackupSettings(checkedPayload<Parameters<typeof updateAutomaticBackupSettings>[0]>("super-admin:backup:settings", payload));
+    restartBackupScheduler();
+    return next;
+  });
+  ipcMain.handle("super-admin:backup:folder", async (event) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const options: OpenDialogOptions = { title: "Choose Automatic Backup Folder", properties: ["openDirectory", "createDirectory"] };
+    const result = parentWindow ? await dialog.showOpenDialog(parentWindow, options) : await dialog.showOpenDialog(options);
+    return result.canceled ? "" : result.filePaths[0] || "";
+  });
+  ipcMain.handle("super-admin:database:export", async (event, payload) => exportDatabaseFile(event, checkedPayload<{ superAdminId: number }>("super-admin:database:export", payload).superAdminId));
+  ipcMain.handle("super-admin:database:restore-preview", async (event, rawPayload) => {
+    const payload = checkedPayload<{ superAdminId: number; password: string }>("super-admin:database:restore-preview", rawPayload);
+    return previewRestoreBackup(event, payload.superAdminId, payload.password);
+  });
+  ipcMain.handle("super-admin:database:restore", async (event, rawPayload) => {
+    const payload = checkedPayload<{ superAdminId: number; password: string; restorePath?: string }>("super-admin:database:restore", rawPayload);
+    return restoreDatabaseBackup(event, payload.superAdminId, payload.password, payload.restorePath);
+  });
+  ipcMain.handle("super-admin:database:clear", async (event, rawPayload) => {
+    const payload = checkedPayload<{ superAdminId: number; password: string }>("super-admin:database:clear", rawPayload);
+    return clearDatabaseWithBackup(event, payload.superAdminId, payload.password);
+  });
+  ipcMain.handle("print:receipt", async (_event, rawPayload) => {
+    const payload = checkedPayload<{ html: string }>("print:receipt", rawPayload);
     let receiptWindow: BrowserWindow | null = null;
     try {
       const settings = getReceiptSettings();
@@ -111,7 +183,8 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
       receiptWindow?.close();
     }
   });
-  ipcMain.handle("receipt:pdf", async (event, payload: { html: string; receiptNo?: string }) => {
+  ipcMain.handle("receipt:pdf", async (event, rawPayload) => {
+    const payload = checkedPayload<{ html: string; receiptNo?: string }>("receipt:pdf", rawPayload);
     let receiptWindow: BrowserWindow | null = null;
     try {
       receiptWindow = await createReceiptWindow(payload.html);
@@ -142,6 +215,7 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   });
 
   createWindow();
+  restartBackupScheduler();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -156,12 +230,19 @@ app.on("second-instance", () => {
 });
 
 app.on("window-all-closed", () => {
+  if (backupTimer) clearInterval(backupTimer);
+  backupTimer = null;
   if (process.platform !== "darwin") app.quit();
 });
 
 function backupFilename(extension = "bak") {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `talyer-pos-backup-${stamp}.${extension}`;
+}
+
+function automaticBackupFilename(date = new Date()) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `backup-${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.bak`;
 }
 
 async function createDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: number) {
@@ -181,9 +262,76 @@ async function createDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: num
     properties: ["showOverwriteConfirmation", "createDirectory"]
   });
   if (canceled || !filePath) return getSuperAdminConsoleData();
-  fs.copyFileSync(databaseFilePath(), filePath);
-  markBackupCreated(superAdminId, `Backup created at ${filePath}`);
+  backupDatabaseFile(filePath);
+  const stats = fs.statSync(filePath);
+  markBackupCreated(superAdminId, `Backup created at ${filePath}`, { filePath, filename: path.basename(filePath), fileSize: stats.size, backupType: "Manual" });
   return getSuperAdminConsoleData();
+}
+
+function restartBackupScheduler() {
+  if (backupTimer) clearInterval(backupTimer);
+  backupTimer = setInterval(() => {
+    void runAutomaticBackupIfDue();
+  }, 60_000);
+  void runAutomaticBackupIfDue();
+}
+
+function scheduledDateKey(date: Date, schedule: string) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  if (schedule === "Monthly") return `${year}-${month}`;
+  return `${year}-${month}-${day}`;
+}
+
+function isAutomaticBackupDue(settings: ReturnType<typeof getAutomaticBackupSettings>, date = new Date()) {
+  if (settings.backup_schedule === "Disabled") return false;
+  if (!settings.backup_folder) return false;
+  const [hour, minute] = String(settings.backup_time || "23:00").split(":").map(Number);
+  if (date.getHours() !== hour || date.getMinutes() !== minute) return false;
+  if (settings.backup_schedule === "Weekly" && date.getDay() !== Number(settings.backup_weekday || 0)) return false;
+  if (settings.backup_schedule === "Monthly" && date.getDate() !== Math.min(Number(settings.backup_month_day || 1), daysInMonth(date))) return false;
+  if (!settings.last_auto_backup_at) return true;
+  return scheduledDateKey(new Date(settings.last_auto_backup_at), settings.backup_schedule) !== scheduledDateKey(date, settings.backup_schedule);
+}
+
+function daysInMonth(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+}
+
+async function runAutomaticBackupIfDue() {
+  if (backupInProgress) return;
+  let targetPath = "";
+  try {
+    const settings = getAutomaticBackupSettings();
+    if (!isAutomaticBackupDue(settings)) return;
+    backupInProgress = true;
+    if (!fs.existsSync(settings.backup_folder)) throw new Error("Automatic backup folder does not exist.");
+    fs.accessSync(settings.backup_folder, fs.constants.W_OK);
+    targetPath = path.join(settings.backup_folder, automaticBackupFilename());
+    backupDatabaseFile(targetPath);
+    const stats = fs.statSync(targetPath);
+    markBackupCreated(undefined, `Automatic backup created at ${targetPath}`, { filePath: targetPath, filename: path.basename(targetPath), fileSize: stats.size, backupType: "Automatic" });
+    enforceBackupRetention(settings.backup_folder, Number(settings.backup_retention_count || 10));
+  } catch (caught) {
+    markBackupFailed(caught instanceof Error ? caught.message : "Automatic backup failed. Please check storage location.", targetPath, "Automatic");
+  } finally {
+    backupInProgress = false;
+  }
+}
+
+function enforceBackupRetention(folder: string, retentionCount: number) {
+  const keep = Math.max(1, retentionCount);
+  const backups = fs.readdirSync(folder)
+    .filter((filename) => /^backup-\d{8}-\d{6}\.bak$/i.test(filename))
+    .map((filename) => {
+      const filePath = path.join(folder, filename);
+      return { filePath, mtime: fs.statSync(filePath).mtimeMs };
+    })
+    .sort((left, right) => right.mtime - left.mtime);
+  for (const backup of backups.slice(keep)) {
+    fs.unlinkSync(backup.filePath);
+  }
 }
 
 async function exportDatabaseFile(event: IpcMainInvokeEvent, superAdminId: number) {
@@ -203,17 +351,65 @@ async function exportDatabaseFile(event: IpcMainInvokeEvent, superAdminId: numbe
   return getSuperAdminConsoleData();
 }
 
-async function restoreDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: number, password: string) {
-  if (!verifySuperAdminPassword(superAdminId, password)) throw new Error("Super Admin password confirmation is invalid.");
+function inspectBackupFile(filePath: string) {
+  if (!fs.existsSync(filePath)) throw new Error("Selected backup file does not exist.");
+  const stats = fs.statSync(filePath);
+  const previewDb = new Database(filePath, { readonly: true, fileMustExist: true });
+  try {
+    const integrity = previewDb.prepare("PRAGMA integrity_check").pluck().get() as string;
+    const tableNames = (previewDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name);
+    const tableSet = new Set(tableNames);
+    const expectedTables = ["users", "sales", "sale_items", "job_orders", "inventory", "audit_logs"];
+    const missingTables = expectedTables.filter((table) => !tableSet.has(table));
+    const countTable = (table: string) => tableSet.has(table) ? Number((previewDb.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count || 0) : 0;
+    return {
+      filePath,
+      filename: path.basename(filePath),
+      fileSize: stats.size,
+      modifiedAt: stats.mtime.toISOString(),
+      integrityOk: integrity === "ok" && missingTables.length === 0,
+      integrityDetail: missingTables.length ? `Missing tables: ${missingTables.join(", ")}` : integrity,
+      counts: {
+        users: countTable("users"),
+        sales: countTable("sales"),
+        jobs: countTable("job_orders"),
+        inventory: countTable("inventory"),
+        auditLogs: countTable("audit_logs")
+      }
+    };
+  } finally {
+    previewDb.close();
+  }
+}
+
+async function chooseRestoreBackupFile(event: IpcMainInvokeEvent, buttonLabel: string) {
   const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
   const dialogOptions: OpenDialogOptions = {
     title: "Restore Database Backup",
-    buttonLabel: "Restore Backup",
+    buttonLabel,
     filters: [{ name: "Database Backup", extensions: ["db", "sqlite", "bak"] }],
     properties: ["openFile"]
   };
-  const { canceled, filePaths } = parentWindow ? await dialog.showOpenDialog(parentWindow, dialogOptions) : await dialog.showOpenDialog(dialogOptions);
-  if (canceled || !filePaths[0]) return getSuperAdminConsoleData();
+  const result = parentWindow ? await dialog.showOpenDialog(parentWindow, dialogOptions) : await dialog.showOpenDialog(dialogOptions);
+  return result.canceled ? "" : result.filePaths[0] || "";
+}
+
+async function previewRestoreBackup(event: IpcMainInvokeEvent, superAdminId: number, password: string) {
+  if (!verifySuperAdminPassword(superAdminId, password)) throw new Error("Super Admin password confirmation is invalid.");
+  const filePath = await chooseRestoreBackupFile(event, "Preview Backup");
+  if (!filePath) return null;
+  const preview = inspectBackupFile(filePath);
+  recordSystemLog({ superAdminId, action: preview.integrityOk ? "Restore Test Passed" : "Restore Test Failed", details: `${preview.filename}: ${preview.integrityDetail}` });
+  return preview;
+}
+
+async function restoreDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: number, password: string, restorePath?: string) {
+  if (!verifySuperAdminPassword(superAdminId, password)) throw new Error("Super Admin password confirmation is invalid.");
+  const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+  const selectedPath = restorePath?.trim() || await chooseRestoreBackupFile(event, "Restore Backup");
+  if (!selectedPath) return getSuperAdminConsoleData();
+  const preview = inspectBackupFile(selectedPath);
+  if (!preview.integrityOk) throw new Error(`Backup integrity check failed. ${preview.integrityDetail}`);
   const confirmed = parentWindow ? await dialog.showMessageBox(parentWindow, {
     type: "warning",
     buttons: ["Cancel", "Restore"],
@@ -237,8 +433,8 @@ async function restoreDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: nu
   const restorePoint = path.join(app.getPath("documents"), backupFilename("restore-point.bak"));
   fs.copyFileSync(currentPath, restorePoint);
   closeDatabase();
-  fs.copyFileSync(filePaths[0], currentPath);
-  recordSystemLog({ superAdminId, action: "Database Restored", details: `Restored from ${filePaths[0]}. Restore point: ${restorePoint}` });
+  fs.copyFileSync(selectedPath, currentPath);
+  recordSystemLog({ superAdminId, action: "Database Restored", details: `Restored from ${selectedPath}. Restore point: ${restorePoint}` });
   return getSuperAdminConsoleData();
 }
 
@@ -325,8 +521,8 @@ function uniqueReceiptFilename(directory: string, receiptNo: string) {
 }
 
 function receiptPageSize(html: string) {
-  const width = Number(html.match(/name="receipt-width-mm" content="(\d+)"/)?.[1]) || 58;
-  const height = Number(html.match(/name="receipt-height-mm" content="(\d+)"/)?.[1]) || 160;
+  const width = Number(html.match(/name="receipt-width-mm" content="([\d.]+)"/)?.[1]) || 58;
+  const height = Number(html.match(/name="receipt-height-mm" content="([\d.]+)"/)?.[1]) || 160;
   return {
     width: Math.round(width * 1000),
     height: Math.round(height * 1000)
