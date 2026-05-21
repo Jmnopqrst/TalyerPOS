@@ -21,6 +21,10 @@ export function formatBytes(bytes: number) {
 
 export function nextBackupText(settings: SuperAdminSettings) {
   if (settings.backup_schedule === "Disabled") return "Not scheduled";
+  const nextHourly = new Date();
+  nextHourly.setSeconds(0, 0);
+  nextHourly.setMinutes(0, 0, 0);
+  nextHourly.setHours(nextHourly.getHours() + 1);
   const [hour, minute] = (settings.backup_time || "23:00").split(":").map(Number);
   const next = new Date();
   next.setSeconds(0, 0);
@@ -38,5 +42,5 @@ export function nextBackupText(settings: SuperAdminSettings) {
       next.setDate(Math.min(Number(settings.backup_month_day || 1), new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate()));
     }
   }
-  return formatDateTime(next);
+  return `Hourly: ${formatDateTime(nextHourly)} | Full: ${formatDateTime(next)}`;
 }

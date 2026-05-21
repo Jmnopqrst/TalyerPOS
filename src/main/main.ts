@@ -1,7 +1,9 @@
-import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent, type OpenDialogOptions, type SaveDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent, type OpenDialogOptions, type SaveDialogOptions } from "electron";
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
+import { Worker } from "node:worker_threads";
 import { clearOldLogs, recordSystemLog } from "./db/audit";
 import { changePassword, createUser, disableUser, enableUser, login, verifySuperAdminPassword } from "./db/auth";
 import { adjustInventoryStock, createInventoryCategory, createInventoryItem, createPurchaseOrder, createSupplier, deleteInventoryCategory, deleteInventoryItem, deleteSupplier, stockInInventoryItem, updateInventoryItem, updatePurchaseOrderStatus, updateSupplier } from "./db/inventory";
@@ -10,12 +12,14 @@ import { listAll, listDataScope, type DataScope } from "./db/migrations";
 import { approvePayrollRun, cancelPayrollRun, createMechanic, createPayrollCutoff, deleteMechanic, generatePayroll, markPayrollPaid, recordMechanicAttendance, setMechanicStatus, submitPayrollForReview, updateMechanic, updateMechanicAttendance, updateMechanicPayroll, updatePayrollSettings, voidPayrollRun } from "./db/payroll";
 import { createSale, voidOrRefundSale } from "./db/sales";
 import { backupDatabaseFile, closeDatabase, databaseFilePath } from "./db/schema";
-import { clearOperationalDatabase, createExpense, createPaymentMethod, createService, deleteExpense, deletePaymentMethod, deleteService, getAutomaticBackupSettings, getReceiptSettings, getSuperAdminConsoleData, markBackupCreated, markBackupFailed, optimizeDatabase, setPaymentMethodStatus, updateAutomaticBackupSettings, updateExpense, updatePaymentMethod, updateReceiptPrinterSettings, updateReceiptSettings, updateService, updateTrialSettings } from "./db/settings";
+import { clearOperationalDatabase, createExpense, createPaymentMethod, createService, deleteExpense, deletePaymentMethod, deleteService, getAutomaticBackupSettings, getLatestBackupByType, getReceiptSettings, getSuperAdminConsoleData, markBackupCreated, markBackupFailed, optimizeDatabase, recordBackupHistory, setPaymentMethodStatus, updateAutomaticBackupSettings, updateExpense, updatePaymentMethod, updateReceiptPrinterSettings, updateReceiptSettings, updateService, updateTrialSettings } from "./db/settings";
 import { validateIpcPayload, type IpcPayloadChannel } from "./ipcValidation";
 
 const isDev = process.env.VITE_DEV_SERVER_URL || !app.isPackaged;
 let backupTimer: NodeJS.Timeout | null = null;
 let backupInProgress = false;
+let backupQueue = Promise.resolve();
+let mainWindow: BrowserWindow | null = null;
 
 function checkedPayload<T>(channel: IpcPayloadChannel, payload: unknown) {
   return validateIpcPayload<T>(channel, payload);
@@ -40,6 +44,12 @@ function getAppIconPath() {
 }
 
 function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+    return mainWindow;
+  }
+
   const win = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -62,6 +72,14 @@ function createWindow() {
   } else {
     win.loadFile(path.join(__dirname, "../renderer/index.html"));
   }
+
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+  });
+  mainWindow = win;
+
+  return win;
 }
 
 if (hasSingleInstanceLock) app.whenReady().then(() => {
@@ -143,6 +161,13 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
     const result = parentWindow ? await dialog.showOpenDialog(parentWindow, options) : await dialog.showOpenDialog(options);
     return result.canceled ? "" : result.filePaths[0] || "";
   });
+  ipcMain.handle("super-admin:backup:open-folder", async () => {
+    const settings = getAutomaticBackupSettings();
+    const folder = backupRoot(settings);
+    fs.mkdirSync(folder, { recursive: true });
+    const result = await shell.openPath(folder);
+    return !result;
+  });
   ipcMain.handle("super-admin:database:export", async (event, payload) => exportDatabaseFile(event, checkedPayload<{ superAdminId: number }>("super-admin:database:export", payload).superAdminId));
   ipcMain.handle("super-admin:database:restore-preview", async (event, rawPayload) => {
     const payload = checkedPayload<{ superAdminId: number; password: string }>("super-admin:database:restore-preview", rawPayload);
@@ -218,14 +243,15 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   restartBackupScheduler();
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    createWindow();
   });
 });
 
 app.on("second-instance", () => {
-  const existingWindow = BrowserWindow.getAllWindows()[0];
+  const existingWindow = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
   if (!existingWindow) return;
   if (existingWindow.isMinimized()) existingWindow.restore();
+  existingWindow.show();
   existingWindow.focus();
 });
 
@@ -245,92 +271,212 @@ function automaticBackupFilename(date = new Date()) {
   return `backup-${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.bak`;
 }
 
+function backupStamp(date = new Date()) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}`;
+}
+
+function defaultBackupRoot() {
+  return path.join(app.getPath("userData"), "backups");
+}
+
+function backupRoot(settings: ReturnType<typeof getAutomaticBackupSettings>) {
+  return settings.backup_folder || defaultBackupRoot();
+}
+
+function backupWorkerPath() {
+  return path.join(__dirname, "backupWorker.js");
+}
+
+function enqueueBackup(task: () => Promise<void>) {
+  backupQueue = backupQueue.then(task, task);
+  return backupQueue;
+}
+
 async function createDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: number) {
   const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
-  const defaultPath = path.join(app.getPath("documents"), backupFilename("bak"));
+  const defaultPath = path.join(app.getPath("documents"), backupFilename("backup"));
   const { canceled, filePath } = parentWindow ? await dialog.showSaveDialog(parentWindow, {
     title: "Create Database Backup",
     defaultPath,
     buttonLabel: "Create Backup",
-    filters: [{ name: "Database Backup", extensions: ["bak", "sqlite", "db"] }],
+    filters: [{ name: "Database Backup", extensions: ["backup"] }],
     properties: ["showOverwriteConfirmation", "createDirectory"]
   }) : await dialog.showSaveDialog({
     title: "Create Database Backup",
     defaultPath,
     buttonLabel: "Create Backup",
-    filters: [{ name: "Database Backup", extensions: ["bak", "sqlite", "db"] }],
+    filters: [{ name: "Database Backup", extensions: ["backup"] }],
     properties: ["showOverwriteConfirmation", "createDirectory"]
   });
   if (canceled || !filePath) return getSuperAdminConsoleData();
-  backupDatabaseFile(filePath);
-  const stats = fs.statSync(filePath);
-  markBackupCreated(superAdminId, `Backup created at ${filePath}`, { filePath, filename: path.basename(filePath), fileSize: stats.size, backupType: "Manual" });
+  const targetPath = path.extname(filePath).toLowerCase() === ".backup" ? filePath : `${filePath}.backup`;
+  const started = Date.now();
+  const result = await runBackupWorker({ kind: "full", dbPath: databaseFilePath(), targetPath });
+  const durationMs = Date.now() - started;
+  if (result.status === "Successful") {
+    markBackupCreated(superAdminId, `Backup created at ${targetPath}`, { filePath: targetPath, filename: path.basename(targetPath), fileSize: result.fileSize, backupType: "Manual", durationMs });
+  } else {
+    markBackupFailed(result.details, targetPath, "Manual", result.status, durationMs);
+  }
   return getSuperAdminConsoleData();
 }
 
 function restartBackupScheduler() {
   if (backupTimer) clearInterval(backupTimer);
   backupTimer = setInterval(() => {
-    void runAutomaticBackupIfDue();
+    void runAutomaticBackupIfDue("scheduled");
   }, 60_000);
-  void runAutomaticBackupIfDue();
+  void runAutomaticBackupIfDue("startup");
 }
 
-function scheduledDateKey(date: Date, schedule: string) {
+function dateKey(date: Date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
-  if (schedule === "Monthly") return `${year}-${month}`;
   return `${year}-${month}-${day}`;
 }
 
-function isAutomaticBackupDue(settings: ReturnType<typeof getAutomaticBackupSettings>, date = new Date()) {
-  if (settings.backup_schedule === "Disabled") return false;
-  if (!settings.backup_folder) return false;
+function hasReachedDailyBackupTime(settings: ReturnType<typeof getAutomaticBackupSettings>, date = new Date()) {
   const [hour, minute] = String(settings.backup_time || "23:00").split(":").map(Number);
-  if (date.getHours() !== hour || date.getMinutes() !== minute) return false;
-  if (settings.backup_schedule === "Weekly" && date.getDay() !== Number(settings.backup_weekday || 0)) return false;
-  if (settings.backup_schedule === "Monthly" && date.getDate() !== Math.min(Number(settings.backup_month_day || 1), daysInMonth(date))) return false;
-  if (!settings.last_auto_backup_at) return true;
-  return scheduledDateKey(new Date(settings.last_auto_backup_at), settings.backup_schedule) !== scheduledDateKey(date, settings.backup_schedule);
+  return date.getHours() > hour || (date.getHours() === hour && date.getMinutes() >= minute);
+}
+
+function hoursSince(value?: string) {
+  if (!value) return Number.POSITIVE_INFINITY;
+  return (Date.now() - new Date(value).getTime()) / 36e5;
 }
 
 function daysInMonth(date: Date) {
   return new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
 }
 
-async function runAutomaticBackupIfDue() {
-  if (backupInProgress) return;
-  let targetPath = "";
-  try {
-    const settings = getAutomaticBackupSettings();
-    if (!isAutomaticBackupDue(settings)) return;
-    backupInProgress = true;
-    if (!fs.existsSync(settings.backup_folder)) throw new Error("Automatic backup folder does not exist.");
-    fs.accessSync(settings.backup_folder, fs.constants.W_OK);
-    targetPath = path.join(settings.backup_folder, automaticBackupFilename());
-    backupDatabaseFile(targetPath);
-    const stats = fs.statSync(targetPath);
-    markBackupCreated(undefined, `Automatic backup created at ${targetPath}`, { filePath: targetPath, filename: path.basename(targetPath), fileSize: stats.size, backupType: "Automatic" });
-    enforceBackupRetention(settings.backup_folder, Number(settings.backup_retention_count || 10));
-  } catch (caught) {
-    markBackupFailed(caught instanceof Error ? caught.message : "Automatic backup failed. Please check storage location.", targetPath, "Automatic");
-  } finally {
-    backupInProgress = false;
-  }
+function runBackupWorker(payload: { kind: "incremental" | "full"; dbPath: string; targetPath: string; since?: string; previousManifestPath?: string }) {
+  return new Promise<{ status: "Successful" | "Failed" | "Corrupted" | "Partial" | "Skipped"; fileSize: number; changedRows: number; details: string }>((resolve, reject) => {
+    const worker = new Worker(backupWorkerPath(), { workerData: payload });
+    worker.once("message", (result) => resolve(result));
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code !== 0) reject(new Error(`Backup worker exited with code ${code}.`));
+    });
+  });
 }
 
-function enforceBackupRetention(folder: string, retentionCount: number) {
-  const keep = Math.max(1, retentionCount);
-  const backups = fs.readdirSync(folder)
-    .filter((filename) => /^backup-\d{8}-\d{6}\.bak$/i.test(filename))
-    .map((filename) => {
-      const filePath = path.join(folder, filename);
-      return { filePath, mtime: fs.statSync(filePath).mtimeMs };
-    })
-    .sort((left, right) => right.mtime - left.mtime);
-  for (const backup of backups.slice(keep)) {
-    fs.unlinkSync(backup.filePath);
+async function runAutomaticBackupIfDue(reason: "startup" | "scheduled") {
+  await enqueueBackup(async () => {
+    if (backupInProgress) return;
+    const settings = getAutomaticBackupSettings();
+    if (settings.backup_schedule === "Disabled") return;
+    const root = backupRoot(settings);
+    fs.mkdirSync(root, { recursive: true });
+    fs.accessSync(root, fs.constants.W_OK);
+
+    const latestIncremental = getLatestBackupByType("Hourly Incremental");
+    const latestFull = getLatestBackupByType("Daily Full");
+    const nowDate = new Date();
+    const shouldRunIncremental = hoursSince(latestIncremental?.backup_date) >= 1;
+    const shouldRunFull = hasReachedDailyBackupTime(settings, nowDate) && (!latestFull || dateKey(new Date(latestFull.backup_date)) !== dateKey(nowDate));
+    const shouldRunMonthly = nowDate.getDate() === Math.min(Number(settings.backup_month_day || 1), daysInMonth(nowDate));
+
+    if (!shouldRunIncremental && !shouldRunFull && !shouldRunMonthly) return;
+
+    backupInProgress = true;
+    try {
+      if (shouldRunIncremental) {
+        await runBackgroundBackup({
+          kind: "incremental",
+          backupType: "Hourly Incremental",
+          targetPath: path.join(root, "hourly", `incremental_${backupStamp(nowDate)}.backup`),
+          since: latestIncremental?.backup_date,
+          previousManifestPath: latestIncremental?.file_path,
+          recoveredMissedBackup: reason === "startup" && Boolean(latestIncremental)
+        });
+      }
+      if (shouldRunFull) {
+        await runBackgroundBackup({
+          kind: "full",
+          backupType: "Daily Full",
+          targetPath: path.join(root, "daily", `full_${dateKey(nowDate)}.backup`),
+          recoveredMissedBackup: reason === "startup" && Boolean(latestFull)
+        });
+      }
+      if (shouldRunMonthly) {
+        const latestMonthly = getLatestBackupByType("Monthly Archive");
+        const monthKey = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, "0")}`;
+        const alreadyArchived = latestMonthly && `${new Date(latestMonthly.backup_date).getFullYear()}-${String(new Date(latestMonthly.backup_date).getMonth() + 1).padStart(2, "0")}` === monthKey;
+        if (!alreadyArchived) {
+          await runBackgroundBackup({
+            kind: "full",
+            backupType: "Monthly Archive",
+            targetPath: path.join(root, "monthly", `monthly_${monthKey}.backup`)
+          });
+        }
+      }
+      enforceBackupRetention(root, Number(settings.backup_retention_count || 30));
+    } catch (caught) {
+      markBackupFailed(caught instanceof Error ? caught.message : "Automatic backup failed. Please check storage location.", "", "Automatic");
+    } finally {
+      backupInProgress = false;
+    }
+  });
+}
+
+async function runBackgroundBackup(payload: { kind: "incremental" | "full"; backupType: "Hourly Incremental" | "Daily Full" | "Monthly Archive"; targetPath: string; since?: string; previousManifestPath?: string; recoveredMissedBackup?: boolean }) {
+  const started = Date.now();
+  const result = await runBackupWorker({ kind: payload.kind, dbPath: databaseFilePath(), targetPath: payload.targetPath, since: payload.since, previousManifestPath: payload.previousManifestPath });
+  const durationMs = Date.now() - started;
+  const details = payload.recoveredMissedBackup ? `Missed backup recovered. ${result.details}` : result.details;
+
+  if (result.status === "Successful") {
+    markBackupCreated(undefined, details, {
+      filePath: payload.targetPath,
+      filename: path.basename(payload.targetPath),
+      fileSize: result.fileSize,
+      backupType: payload.backupType,
+      durationMs
+    });
+    return;
+  }
+
+  if (result.status === "Skipped") {
+    recordBackupHistory({
+      filename: path.basename(payload.targetPath),
+      filePath: payload.targetPath,
+      fileSize: 0,
+      backupType: payload.backupType,
+      status: "Skipped",
+      durationMs,
+      details
+    });
+    return;
+  }
+
+  markBackupFailed(details, payload.targetPath, payload.backupType, result.status, durationMs);
+}
+
+function enforceBackupRetention(root: string, dailyRetentionDays: number) {
+  const dailyDays = Math.max(7, Math.min(30, dailyRetentionDays));
+  const rules = [
+    { folder: path.join(root, "hourly"), maxAgeMs: 48 * 60 * 60 * 1000, keepMin: 1 },
+    { folder: path.join(root, "daily"), maxAgeMs: dailyDays * 24 * 60 * 60 * 1000, keepMin: 1 },
+    { folder: path.join(root, "monthly"), maxAgeMs: 12 * 31 * 24 * 60 * 60 * 1000, keepMin: 1 }
+  ];
+
+  for (const rule of rules) {
+    if (!fs.existsSync(rule.folder)) continue;
+    const backups = fs.readdirSync(rule.folder)
+      .filter((filename) => filename.endsWith(".backup"))
+      .map((filename) => {
+        const filePath = path.join(rule.folder, filename);
+        return { filePath, mtime: fs.statSync(filePath).mtimeMs, size: fs.statSync(filePath).size };
+      })
+      .filter((backup) => backup.size > 0)
+      .sort((left, right) => right.mtime - left.mtime);
+    const latestValid = new Set(backups.slice(0, rule.keepMin).map((backup) => backup.filePath));
+    for (const backup of backups) {
+      if (latestValid.has(backup.filePath)) continue;
+      if (Date.now() - backup.mtime > rule.maxAgeMs) fs.unlinkSync(backup.filePath);
+    }
   }
 }
 
@@ -354,7 +500,12 @@ async function exportDatabaseFile(event: IpcMainInvokeEvent, superAdminId: numbe
 function inspectBackupFile(filePath: string) {
   if (!fs.existsSync(filePath)) throw new Error("Selected backup file does not exist.");
   const stats = fs.statSync(filePath);
-  const previewDb = new Database(filePath, { readonly: true, fileMustExist: true });
+  if (path.extname(filePath).toLowerCase() === ".backup" && (/(?:^|[\\/])hourly[\\/]/i.test(filePath) || path.basename(filePath).startsWith("incremental_"))) {
+    throw new Error("Incremental backups are recovery logs. Please choose a daily full or monthly archive backup for restore.");
+  }
+  const isCompressedBackup = path.extname(filePath).toLowerCase() === ".backup";
+  const previewPath = isCompressedBackup ? inflateFullBackupToTemp(filePath) : filePath;
+  const previewDb = new Database(previewPath, { readonly: true, fileMustExist: true });
   try {
     const integrity = previewDb.prepare("PRAGMA integrity_check").pluck().get() as string;
     const tableNames = (previewDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name);
@@ -379,7 +530,22 @@ function inspectBackupFile(filePath: string) {
     };
   } finally {
     previewDb.close();
+    if (previewPath !== filePath) fs.rmSync(previewPath, { force: true });
   }
+}
+
+function inflateFullBackupToTemp(filePath: string) {
+  const tempPath = path.join(app.getPath("temp"), `talyer-restore-preview-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`);
+  fs.writeFileSync(tempPath, zlib.gunzipSync(fs.readFileSync(filePath)));
+  return tempPath;
+}
+
+function materializeRestoreSource(filePath: string) {
+  if (path.extname(filePath).toLowerCase() !== ".backup") return filePath;
+  if (/(?:^|[\\/])hourly[\\/]/i.test(filePath) || path.basename(filePath).startsWith("incremental_")) {
+    throw new Error("Incremental backups are audit/recovery logs. Please restore from a daily full or monthly archive backup.");
+  }
+  return inflateFullBackupToTemp(filePath);
 }
 
 async function chooseRestoreBackupFile(event: IpcMainInvokeEvent, buttonLabel: string) {
@@ -387,7 +553,7 @@ async function chooseRestoreBackupFile(event: IpcMainInvokeEvent, buttonLabel: s
   const dialogOptions: OpenDialogOptions = {
     title: "Restore Database Backup",
     buttonLabel,
-    filters: [{ name: "Database Backup", extensions: ["db", "sqlite", "bak"] }],
+    filters: [{ name: "Database Backup", extensions: ["backup", "db", "sqlite", "bak"] }],
     properties: ["openFile"]
   };
   const result = parentWindow ? await dialog.showOpenDialog(parentWindow, dialogOptions) : await dialog.showOpenDialog(dialogOptions);
@@ -431,9 +597,11 @@ async function restoreDatabaseBackup(event: IpcMainInvokeEvent, superAdminId: nu
 
   const currentPath = databaseFilePath();
   const restorePoint = path.join(app.getPath("documents"), backupFilename("restore-point.bak"));
+  const restoreSource = materializeRestoreSource(selectedPath);
   fs.copyFileSync(currentPath, restorePoint);
   closeDatabase();
-  fs.copyFileSync(selectedPath, currentPath);
+  fs.copyFileSync(restoreSource, currentPath);
+  if (restoreSource !== selectedPath) fs.rmSync(restoreSource, { force: true });
   recordSystemLog({ superAdminId, action: "Database Restored", details: `Restored from ${selectedPath}. Restore point: ${restorePoint}` });
   return getSuperAdminConsoleData();
 }
@@ -475,6 +643,8 @@ async function createReceiptWindow(html: string, requireReceiptContent = true) {
     width: 900,
     height: 1200,
     show: false,
+    skipTaskbar: true,
+    focusable: false,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,

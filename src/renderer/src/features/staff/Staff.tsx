@@ -93,21 +93,6 @@ export function Staff({ data, user, searchTerm = "", onRefresh }: { data: AppDat
     }
   }
 
-  async function disableMechanic(mechanic: UserAccount) {
-    if (!canManageMechanics) return;
-    const confirmed = window.confirm("Are you sure you want to disable this mechanic?");
-    if (!confirmed) return;
-    setError("");
-    setMessage("");
-    try {
-      await withTimeout(window.talyer.setMechanicStatus({ actorId: user.id, mechanicId: mechanic.id, status: "Disabled" }), "disabling mechanic");
-      setMessage("Mechanic disabled successfully.");
-      await onRefresh();
-    } catch (caught) {
-      setError(friendlyError(caught, "Unable to disable mechanic. Please try again."));
-    }
-  }
-
   async function deleteMechanic(mechanic: UserAccount) {
     if (!canManageMechanics) return;
     const confirmed = window.confirm("Are you sure you want to delete this mechanic?");
@@ -154,7 +139,6 @@ export function Staff({ data, user, searchTerm = "", onRefresh }: { data: AppDat
                   <td>
                     <div className="table-actions">
                       <button className="table-action" onClick={() => openEdit(mechanic)}><Pencil size={15} /> Edit</button>
-                      <button className="table-action danger-action" disabled={mechanic.status !== "Active"} onClick={() => disableMechanic(mechanic)}>Disable</button>
                       <button className="table-action danger-action" onClick={() => deleteMechanic(mechanic)}><Trash2 size={15} /> Delete</button>
                     </div>
                   </td>

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { UserAccount } from "../../types/global";
 import { friendlyError, withTimeout } from "../lib/api";
+import { isEditableTarget } from "../lib/dom";
 import { useToast } from "../../components/Toast";
 
 const SCANNER_CHAR_TIMEOUT_MS = 85;
@@ -54,6 +55,11 @@ export function useGlobalQrAttendanceScanner({ user, enabled, onRecorded }: { us
     }
 
     function handleKeyDown(event: KeyboardEvent) {
+      if (isEditableTarget(event.target)) {
+        resetBuffer();
+        return;
+      }
+
       const now = Date.now();
       if (event.key === "Enter") {
         const code = bufferRef.current;

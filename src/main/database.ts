@@ -40,14 +40,19 @@ export interface SuperAdminSettings {
   updated_at: string;
 }
 
+function normalizeBackupSchedule(value: string): SuperAdminSettings["backup_schedule"] {
+  return ["Daily", "Weekly", "Monthly"].includes(value) ? value as SuperAdminSettings["backup_schedule"] : "Disabled";
+}
+
 export interface BackupHistoryRow {
   id: number;
   filename: string;
   file_path: string;
   backup_date: string;
   file_size: number;
-  backup_type: "Manual" | "Automatic";
-  status: "Success" | "Failed";
+  backup_type: "Manual" | "Automatic" | "Hourly Incremental" | "Daily Full" | "Monthly Archive";
+  status: "Success" | "Successful" | "Failed" | "Corrupted" | "Partial" | "Skipped";
+  duration_ms: number;
   details: string;
   created_at: string;
 }
@@ -529,12 +534,14 @@ function ensureSuperAdminTables(database: Database.Database) {
       file_path TEXT NOT NULL,
       backup_date TEXT NOT NULL,
       file_size INTEGER NOT NULL DEFAULT 0,
-      backup_type TEXT NOT NULL CHECK(backup_type IN ('Manual','Automatic')),
-      status TEXT NOT NULL CHECK(status IN ('Success','Failed')),
+      backup_type TEXT NOT NULL CHECK(backup_type IN ('Manual','Automatic','Hourly Incremental','Daily Full','Monthly Archive')),
+      status TEXT NOT NULL CHECK(status IN ('Success','Successful','Failed','Corrupted','Partial','Skipped')),
+      duration_ms INTEGER NOT NULL DEFAULT 0,
       details TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
   `);
+  ensureBackupHistorySchema(database);
 
   const superAdmin = database.prepare("SELECT id FROM super_admins WHERE lower(username) = lower('superadmin')").get();
   if (!superAdmin) {
@@ -564,6 +571,34 @@ function ensureSuperAdminTables(database: Database.Database) {
       VALUES (1, 1, ?, 30, '', 'Trial', '', 'Disabled', 0, ?)
     `).run(now(), now());
   }
+}
+
+function ensureBackupHistorySchema(database: Database.Database) {
+  const table = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'backup_history'").get() as { sql: string } | undefined;
+  const needsRebuild = !table?.sql.includes("Hourly Incremental") || !table.sql.includes("Corrupted");
+  if (needsRebuild) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS backup_history_next (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        backup_date TEXT NOT NULL,
+        file_size INTEGER NOT NULL DEFAULT 0,
+        backup_type TEXT NOT NULL CHECK(backup_type IN ('Manual','Automatic','Hourly Incremental','Daily Full','Monthly Archive')),
+        status TEXT NOT NULL CHECK(status IN ('Success','Successful','Failed','Corrupted','Partial','Skipped')),
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        details TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO backup_history_next (id, filename, file_path, backup_date, file_size, backup_type, status, duration_ms, details, created_at)
+      SELECT id, filename, file_path, backup_date, file_size, backup_type, status, 0, details, created_at FROM backup_history;
+      DROP TABLE backup_history;
+      ALTER TABLE backup_history_next RENAME TO backup_history;
+    `);
+    return;
+  }
+  const columns = new Set((database.prepare("PRAGMA table_info(backup_history)").all() as Array<{ name: string }>).map((column) => column.name));
+  if (!columns.has("duration_ms")) database.prepare("ALTER TABLE backup_history ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0").run();
 }
 
 function ensurePayroll(database: Database.Database) {
@@ -1069,7 +1104,7 @@ function resetSystemSettingsToDefaults(database: Database.Database, timestamp = 
         license_key = '',
         license_status = 'Activated',
         last_backup_at = '',
-        backup_schedule = 'Manual',
+        backup_schedule = 'Disabled',
         updated_at = ?
     WHERE id = 1
   `).run(timestamp, timestamp);
@@ -1442,7 +1477,7 @@ export function listReportsData() {
 function getSuperAdminSettings(database = getDatabase()) {
   const settings = database.prepare("SELECT * FROM super_admin_settings WHERE id = 1").get() as SuperAdminSettings;
   const trial = trialStatus(settings);
-  return { ...settings, trial };
+  return { ...settings, backup_schedule: normalizeBackupSchedule(settings.backup_schedule), trial };
 }
 
 function trialStatus(settings: SuperAdminSettings) {
@@ -1493,7 +1528,7 @@ export function getSuperAdminConsoleData() {
   ];
   const databasePath = databaseFilePath();
   const walPath = `${databasePath}-wal`;
-  const failedBackups = database.prepare("SELECT COUNT(*) as count FROM backup_history WHERE status = 'Failed'").get() as { count: number };
+  const failedBackups = database.prepare("SELECT COUNT(*) as count FROM backup_history WHERE status IN ('Failed','Corrupted','Partial')").get() as { count: number };
   const approvalSensitive = database.prepare("SELECT COUNT(*) as count FROM sales WHERE status = 'Completed'").get() as { count: number };
   const failedReceipts = database.prepare("SELECT COUNT(*) as count FROM system_logs WHERE action LIKE '%failed%' OR details LIKE '%failed%'").get() as { count: number };
   const settings = getSuperAdminSettings(database);
@@ -1576,10 +1611,11 @@ export function updateAutomaticBackupSettings(payload: {
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) throw new Error("Backup time is invalid.");
   const weekday = Math.max(0, Math.min(6, Number(payload.backupWeekday) || 0));
   const monthDay = Math.max(1, Math.min(31, Number(payload.backupMonthDay) || 1));
-  const retention = Math.max(1, Math.min(365, Number(payload.backupRetentionCount) || 10));
-  const folder = payload.backupFolder.trim();
+  const retention = Math.max(7, Math.min(30, Number(payload.backupRetentionCount) || 10));
+  const folder = payload.backupFolder.trim() || (schedule === "Disabled" ? "" : path.join(app.getPath("userData"), "backups"));
   if (schedule !== "Disabled") {
     if (!folder) throw new Error("Backup folder is required for automatic backups.");
+    fs.mkdirSync(folder, { recursive: true });
     if (!fs.existsSync(folder)) throw new Error("Backup folder does not exist.");
     fs.accessSync(folder, fs.constants.W_OK);
   }
@@ -1593,33 +1629,50 @@ export function updateAutomaticBackupSettings(payload: {
   return getSuperAdminConsoleData();
 }
 
-export function recordBackupHistory(payload: { filename: string; filePath: string; fileSize?: number; backupType: "Manual" | "Automatic"; status: "Success" | "Failed"; details: string }) {
+export function recordBackupHistory(payload: {
+  filename: string;
+  filePath: string;
+  fileSize?: number;
+  backupType: BackupHistoryRow["backup_type"];
+  status: BackupHistoryRow["status"];
+  durationMs?: number;
+  details: string;
+}) {
   const database = getDatabase();
   const createdAt = now();
   database.prepare(`
-    INSERT INTO backup_history (filename, file_path, backup_date, file_size, backup_type, status, details, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(payload.filename, payload.filePath, createdAt, payload.fileSize || 0, payload.backupType, payload.status, payload.details, createdAt);
+    INSERT INTO backup_history (filename, file_path, backup_date, file_size, backup_type, status, duration_ms, details, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(payload.filename, payload.filePath, createdAt, payload.fileSize || 0, payload.backupType, payload.status, payload.durationMs || 0, payload.details, createdAt);
 }
 
-export function markBackupCreated(superAdminId: number | undefined, details: string, meta?: { filename?: string; filePath?: string; fileSize?: number; backupType?: "Manual" | "Automatic" }) {
+export function markBackupCreated(superAdminId: number | undefined, details: string, meta?: { filename?: string; filePath?: string; fileSize?: number; backupType?: BackupHistoryRow["backup_type"]; durationMs?: number }) {
   const database = getDatabase();
   const timestamp = now();
   database.prepare("UPDATE super_admin_settings SET last_backup_at = ?, last_backup_error = '', updated_at = ? WHERE id = 1").run(timestamp, timestamp);
-  if (meta?.backupType === "Automatic") database.prepare("UPDATE super_admin_settings SET last_auto_backup_at = ? WHERE id = 1").run(timestamp);
-  if (meta?.filePath) recordBackupHistory({ filename: meta.filename || path.basename(meta.filePath), filePath: meta.filePath, fileSize: meta.fileSize || 0, backupType: meta.backupType || "Manual", status: "Success", details });
+  if (meta?.backupType === "Automatic" || meta?.backupType === "Hourly Incremental" || meta?.backupType === "Daily Full" || meta?.backupType === "Monthly Archive") database.prepare("UPDATE super_admin_settings SET last_auto_backup_at = ? WHERE id = 1").run(timestamp);
+  if (meta?.filePath) recordBackupHistory({ filename: meta.filename || path.basename(meta.filePath), filePath: meta.filePath, fileSize: meta.fileSize || 0, backupType: meta.backupType || "Manual", status: "Successful", durationMs: meta.durationMs, details });
   recordSystemLog({ superAdminId, action: "Backup Created", details });
 }
 
-export function markBackupFailed(details: string, filePath = "", backupType: "Manual" | "Automatic" = "Automatic") {
+export function markBackupFailed(details: string, filePath = "", backupType: BackupHistoryRow["backup_type"] = "Automatic", status: BackupHistoryRow["status"] = "Failed", durationMs = 0) {
   const database = getDatabase();
   database.prepare("UPDATE super_admin_settings SET last_backup_error = ?, updated_at = ? WHERE id = 1").run(details, now());
-  recordBackupHistory({ filename: filePath ? path.basename(filePath) : "Automatic backup", filePath, backupType, status: "Failed", details });
+  recordBackupHistory({ filename: filePath ? path.basename(filePath) : "Automatic backup", filePath, backupType, status, durationMs, details });
   recordSystemLog({ action: "Backup Failed", details });
 }
 
 export function getAutomaticBackupSettings() {
   return getSuperAdminSettings(getDatabase());
+}
+
+export function getLatestBackupByType(backupType: BackupHistoryRow["backup_type"]) {
+  return getDatabase().prepare(`
+    SELECT * FROM backup_history
+    WHERE backup_type = ? AND status IN ('Success','Successful')
+    ORDER BY backup_date DESC, id DESC
+    LIMIT 1
+  `).get(backupType) as BackupHistoryRow | undefined;
 }
 
 export function optimizeDatabase(payload: { superAdminId: number }) {

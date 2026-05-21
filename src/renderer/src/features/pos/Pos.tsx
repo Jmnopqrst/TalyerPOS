@@ -9,6 +9,7 @@ import { useFilteredPagination } from "../../hooks/useFilteredPagination";
 import { friendlyError, withTimeout } from "../../lib/api";
 import { approvalReady, approvalValidationError, emptyApproval } from "../../lib/approval";
 import { formatDateTime, rowMatchesDate, todayInputValue } from "../../lib/date";
+import { isEditableTarget } from "../../lib/dom";
 import { money } from "../../lib/format";
 import { valueMatchesSearch } from "../../lib/search";
 import { buildReceiptHtml } from "../../documents/receipt";
@@ -140,6 +141,7 @@ export function Pos({ data, user, searchTerm = "", onRefresh }: { data: AppData;
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
       if (event.key === "F2" && cart.length > 0 && !isProcessing && activePaymentMethods.length > 0) {
         event.preventDefault();
         setShowPayment(true);

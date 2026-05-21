@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Badge } from "../../../components/Badge";
 import { DataTable } from "../../../components/DataTable";
-import type { AppData, Customer, JobOrder, Motorcycle, SaleItem, UserAccount } from "../../../types/global";
+import type { AppData, Customer, JobOrder, Motorcycle, UserAccount } from "../../../types/global";
 import { formatDateOnly, formatDateTime } from "../../lib/date";
 import { money } from "../../lib/format";
 import { valueMatchesSearch } from "../../lib/search";
@@ -36,12 +36,8 @@ export function Customers({ data, searchTerm = "" }: { data: AppData; user: User
   const customerMotorcycles = selectedCustomer
     ? data.motorcycles.filter((motorcycle) => motorcycle.customer_id === selectedCustomer.id || customerJobs.some((job) => job.plate_no === motorcycle.plate_no))
     : [];
-  const customerSales = selectedCustomer ? data.sales.filter((sale) => sale.customer_name === selectedCustomer.name) : [];
-  const saleIds = new Set(customerSales.map((sale) => sale.id));
-  const customerSaleItems = data.saleItems.filter((item) => saleIds.has(item.sale_id));
-  const totalSpent = customerJobs.reduce((sum, job) => sum + Number(job.paid_at ? job.total_amount : 0), 0)
-    + customerSales.reduce((sum, sale) => sum + (sale.status === "Completed" ? sale.total : 0), 0);
-  const lastVisit = [...customerJobs.map((job) => job.paid_at || job.created_at), ...customerSales.map((sale) => sale.created_at)]
+  const totalSpent = customerJobs.reduce((sum, job) => sum + Number(job.paid_at ? job.total_amount : 0), 0);
+  const lastVisit = customerJobs.map((job) => job.paid_at || job.created_at)
     .filter(Boolean)
     .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0];
 
@@ -105,18 +101,6 @@ export function Customers({ data, searchTerm = "" }: { data: AppData; user: User
           { key: "mechanic", label: "Mechanic", render: (row) => row.mechanic_name || "Unassigned" },
           { key: "status", label: "Status", render: (row) => <Badge tone={row.paid_at ? "good" : normalizeJobStatusForUi(row.status) === "Completed" ? "warn" : "neutral"}>{row.paid_at ? "Paid" : normalizeJobStatusForUi(row.status)}</Badge> },
           { key: "total", label: "Total", render: (row) => money.format(Number(row.total_amount || row.estimate || 0)) }
-        ]}
-      />
-
-      <DataTable<SaleItem>
-        title="POS Purchase Items"
-        rows={customerSaleItems}
-        emptyMessage="No customer-linked POS purchases found."
-        columns={[
-          { key: "item", label: "Item", render: (row) => row.name },
-          { key: "qty", label: "Qty", render: (row) => String(row.quantity) },
-          { key: "price", label: "Unit Price", render: (row) => money.format(row.unit_price) },
-          { key: "total", label: "Total", render: (row) => money.format(row.line_total) }
         ]}
       />
     </div>

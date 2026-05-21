@@ -61,6 +61,7 @@ type TalyerApi = {
   createBackup(payload: RendererTypes.SuperAdminActionPayload): Promise<unknown>;
   updateAutomaticBackupSettings(payload: RendererTypes.UpdateAutomaticBackupSettingsPayload): Promise<unknown>;
   chooseBackupFolder(): Promise<unknown>;
+  openBackupFolder(): Promise<unknown>;
   exportDatabase(payload: RendererTypes.SuperAdminActionPayload): Promise<unknown>;
   previewRestoreDatabase(payload: RendererTypes.RestoreDatabasePayload): Promise<unknown>;
   restoreDatabase(payload: RendererTypes.RestoreDatabasePayload): Promise<unknown>;
@@ -129,6 +130,7 @@ const talyerApi: TalyerApi = {
   createBackup: (payload) => ipcRenderer.invoke("super-admin:backup:create", payload),
   updateAutomaticBackupSettings: (payload) => ipcRenderer.invoke("super-admin:backup:settings", payload),
   chooseBackupFolder: () => ipcRenderer.invoke("super-admin:backup:folder"),
+  openBackupFolder: () => ipcRenderer.invoke("super-admin:backup:open-folder"),
   exportDatabase: (payload) => ipcRenderer.invoke("super-admin:database:export", payload),
   previewRestoreDatabase: (payload) => ipcRenderer.invoke("super-admin:database:restore-preview", payload),
   restoreDatabase: (payload) => ipcRenderer.invoke("super-admin:database:restore", payload),

@@ -62,6 +62,7 @@ declare global {
       createBackup(payload: SuperAdminActionPayload): Promise<SuperAdminData>;
       updateAutomaticBackupSettings(payload: UpdateAutomaticBackupSettingsPayload): Promise<SuperAdminData>;
       chooseBackupFolder(): Promise<string>;
+      openBackupFolder(): Promise<boolean>;
       exportDatabase(payload: SuperAdminActionPayload): Promise<SuperAdminData>;
       previewRestoreDatabase(payload: RestoreDatabasePayload): Promise<BackupRestorePreview | null>;
       restoreDatabase(payload: RestoreDatabasePayload): Promise<SuperAdminData>;
@@ -251,8 +252,9 @@ export interface BackupHistory {
   file_path: string;
   backup_date: string;
   file_size: number;
-  backup_type: "Manual" | "Automatic";
-  status: "Success" | "Failed";
+  backup_type: "Manual" | "Automatic" | "Hourly Incremental" | "Daily Full" | "Monthly Archive";
+  status: "Success" | "Successful" | "Failed" | "Corrupted" | "Partial" | "Skipped";
+  duration_ms: number;
   details: string;
   created_at: string;
 }
